@@ -7,7 +7,10 @@ they're single-page JavaScript apps: easy to click through one record at a time,
 in bulk. This tool talks directly to the JSON APIs behind those apps, so you can search by town,
 address, applicant, permit type, file number, or date — and download the attached documents.
 
-It works as a plain Python CLI, or as a skill that an agentic coding agent  can drive for you.
+It works as a plain Python CLI, or as a skill that an agentic coding agent  can drive for you. Like this:
+
+
+<img width="1211" height="577" alt="image" src="https://github.com/user-attachments/assets/f4153a9a-eb2a-4d6e-b830-8887a16daa58" />
 
 ---
 
