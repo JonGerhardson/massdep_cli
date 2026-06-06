@@ -1,0 +1,125 @@
+---
+name: mass-env-permits
+description: >
+  Massachusetts environmental-permitting public data — search MassDEP air-quality plan approvals
+  & all DEP/DCR/MDAR permit records (ePlace), MEPA environmental review filings (ENF/EIR/NPC/
+  Secretary's Certificates, eMonitor), and the Source Registration / Greenhouse Gas filers roster;
+  list and download attached PDFs. Triggers on: MEPA, eMonitor, ENF, EIR, EENF, NPC, EEA file
+  number, MassDEP, ePlace, air quality plan approval, AQ permit, 310 CMR 7.00, source registration,
+  greenhouse gas filers, MA environmental permit/filing, environmental permitting, proponent search.
+---
+
+# mass-env-permits — Massachusetts environmental permitting & filings
+
+Programmatic, read-only access to three public, no-login MA environmental data sources whose REST/JSON
+APIs are hidden behind JavaScript SPAs. Use it to check whether a project/proponent has filed
+environmental paperwork — e.g. *"has a proposed project at a given address filed a MEPA ENF or a
+MassDEP Air Quality Plan Approval?"* — and to pull the attached documents.
+
+| Source | What it covers | Access |
+|--------|----------------|--------|
+| **MassDEP ePlace** | Air-quality plan approvals + all DEP/DCR/MDAR permit applications/authorizations, with documents | REST (no auth) |
+| **MEPA eMonitor** | Environmental review filings: ENF, EIR (DEIR/FEIR), NPC, Secretary's Certificates, with attachments | REST (public x-api-key) |
+| **SR-GHG filers** | Annual Source Registration / Greenhouse Gas filer roster (who must file + class + schedule) | xlsx (bundled) |
+
+The client (`mass_env.py`) is polite by default: generic non-identifying User-Agent, ≤1 req/sec,
+retries with backoff. API base URLs and the MEPA key are **re-discovered from the live config at
+runtime** (never hard-coded), so the client survives portal redeploys.
+
+## CLI
+
+```
+python mass_env.py <command> [options]            # add -v to log requests
+```
+
+| Command | Purpose |
+|---------|---------|
+| `search-permits` | Search MassDEP permits (`--city --address --applicant --facility --application-id --permit-types --statuses --from --to`) |
+| `permit-detail RECORD_ID` | MassDEP record detail + document list (`--checkbox-code` from the search row) |
+| `massdep-download DOC_ID` | Download a MassDEP document by `DocId` (`-o file.pdf`) |
+| `search-mepa` | Search MEPA projects (`--project-name --eea-no --town --submittal-type --from --to`; `--proponent` see caveat) |
+| `mepa-project PROJECT_ID` | MEPA project detail (JSON) |
+| `mepa-attachments SUBMITTAL_ID` | List a submittal's attachments (gives `fileServiceId`) |
+| `mepa-download FILE_SERVICE_ID` | Download a MEPA attachment (`-o file.pdf`) |
+| `sr-ghg` | Query the SR-GHG filer roster (`--town --facility --refresh`) |
+| `info` | Show discovered API bases + reference lists |
+
+All list commands take `-f table|csv|json` and `-o OUTPUT`.
+
+## Examples
+
+```bash
+# Air-quality permits in a municipality (AQ = on-site combustion / plan approvals)
+python mass_env.py search-permits --city Worcester --permit-types AQ
+
+# A specific air permit's documents, then download one
+python mass_env.py permit-detail 26CAP-00000-002QR --checkbox-code TR_CPA_FUEL
+python mass_env.py massdep-download 1719226 -o plan_approval.pdf
+
+# Has a project filed a MEPA review? (project name / eeaNo / town are the reliable filters)
+python mass_env.py search-mepa --eea-no 3247
+python mass_env.py search-mepa --town Worcester -f csv -o worcester_mepa.csv
+python mass_env.py search-mepa --project-name "Wastewater"
+
+# Download a MEPA filing's attachment
+python mass_env.py mepa-attachments <submittal-id>
+python mass_env.py mepa-download <file-service-id> -o filing.pdf
+
+# Which facilities in a town must file Source Registration / GHG?
+python mass_env.py sr-ghg --town WORCESTER
+python mass_env.py sr-ghg --refresh --facility "treatment"   # re-pull the latest xlsx via wget
+```
+
+## Investigative workflow
+
+To check whether a proposed project has filed: (1) `search-mepa --project-name "<name>"` and
+`--town <municipality>` for an ENF/EIR/NPC; (2) `search-permits --city <town> --permit-types AQ` (or
+`--applicant`/`--facility`) for an Air Quality Plan Approval; (3) `sr-ghg --town <town>` for the
+existing-emitter roster. **"Nothing filed" is a valid, informative result** — a genuine MEPA no-match
+returns `totalRecords 0`. Cross-link the sources via `eeaNo` (MEPA) ↔ `MepaProjectNumber` (ePlace) and
+`AQ ID#` (SR-GHG) ↔ `FacilityID` (ePlace).
+
+## Key concepts
+
+- **MassDEP authorization types** (`--permit-types`, comma list of AccelaType codes):
+  DEP: `AQ` (air quality), `DW`, `HW`, `SW`, `TUR`, `WM`, `WW`, `WP`, `LES`; DCR: `SUP`, `CAP`;
+  MDAR: `Pesticide`, `Plant Industries`. **Air permits = `AQ`**; AQ02**F** = a *Fuel/combustion*
+  plan-approval application (emergency/stationary engines, turbines under 310 CMR 7.00/7.02).
+- **MassDEP statuses** (`--statuses`): `In Review`, `Public Comment Pending`, `Approved`, `Denied`,
+  `Withdrawn`.
+- **MEPA submittal types**: `ENF` (Environmental Notification Form), `EENF`, `DEIR`/`FEIR`/`EIR`,
+  `NPC` (Notice of Project Change), `* Cert` (Secretary's Certificate), `EDR`. `eeaNo` = the public
+  EEA/MEPA file number.
+- **MEPA `--proponent` is unreliable**: the public API's `ProponentName` filter is non-functional
+  (proponent names live in a separate contacts system). A proponent query returns the global total
+  with an empty list; the CLI prints a warning. Search by `--project-name` / `--town` / `--eea-no`
+  instead.
+- **Detail params**: MassDEP `permit-detail` needs the `RecordId` **and** the `CheckBoxCode` from the
+  search row. MEPA downloads need the `fileServiceId` (short token), not the `attachmentId` GUID.
+
+## Architecture notes
+
+- MassDEP ePlace API base `https://eplace.eea.mass.gov/EEAPublicAppAPI` (no auth). Search is a single
+  `POST /api/Search/Applications`; there is no server pagination (>200 rows → "refine search").
+- MEPA is an AWS API Gateway requiring a **public** `x-api-key` read from the SPA's
+  `assets/config/config.json`. Attachment download is a 3-step token dance ending at a presigned S3
+  URL that must be fetched *without* auth headers.
+- SR-GHG: mass.gov bot-blocks curl/requests; the client uses **wget** to refresh, else the bundled
+  `data/sr-ghg-filers-list.xlsx` snapshot.
+- Full endpoint/field documentation: **`references/API_NOTES.md`**.
+
+## Dependencies
+
+`requests` (APIs), `openpyxl` (SR-GHG xlsx), and `wget` on PATH (SR-GHG refresh). `pandas` optional
+for analysis of the JSON/CSV output.
+
+## Relationship to other skills
+
+Same MA-government public-data family as **commbuys** (procurement) and **govqa** (public-records
+requests). When a MEPA/MassDEP record references a contractor or contract, COMMBUYS can cross-reference
+the vendor; for documents not online, file a request via govqa.
+
+## Source
+
+Client + CLI: `mass_env.py` (in this skill dir). Endpoint reference: `references/API_NOTES.md`.
+Bundled data: `data/sr-ghg-filers-list.xlsx`.
