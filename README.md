@@ -9,8 +9,7 @@ address, applicant, permit type, file/RTN number, or date — across permitting,
 compliance & enforcement, drinking water, wetlands, waste-site cleanups, sewage overflows, and more —
 and download the attached documents.
 
-It works as a plain Python CLI, and (if you use [Claude Code](https://claude.com/claude-code)) as a
-skill that Claude can drive for you.
+It works as a plain Python CLI, and as a skill that a coding agent can drive for you.
 
 ---
 
