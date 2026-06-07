@@ -1,6 +1,6 @@
 # mass-env-permits
 
-**Search Massachusetts environmental data from the command line — and pull the PDFs.**
+**Search Massachusetts environmental data and pull source documents from the command line.**
 
 Massachusetts publishes a lot of environmental data through public, no-login websites. The trouble is
 they're single-page JavaScript apps: easy to click through one record at a time, impossible to query
