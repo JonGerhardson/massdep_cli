@@ -32,13 +32,16 @@ Usage examples:
 """
 
 import argparse
+import base64
 import csv
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import time
+from urllib.parse import urljoin
 
 import requests
 
@@ -58,6 +61,38 @@ EPLACE_REFERER = f"{EPLACE_APP}/"
 MEPA_APP = "https://eeaonline.eea.state.ma.us/EEA/MEPA-eMonitor"
 MEPA_CONFIG_URL = f"{MEPA_APP}/assets/config/config.json"
 MEPA_STATE_ID_MA = 22  # Massachusetts StateId for the postal town lookup
+
+# EEA Data Portal "DataLake" SPA — API base lives in a <meta> tag, not a JSON file.
+DATALAKE_ORIGIN = "https://eeaonline.eea.state.ma.us"
+DATALAKE_PORTAL = f"{DATALAKE_ORIGIN}/Portal"
+DATALAKE_REFERER = f"{DATALAKE_PORTAL}/"
+
+# CSO / SSO Sewage Notification SPA (appconfig.json; Referer REQUIRED by the server).
+CSO_APP = "https://eeaonline.eea.state.ma.us/portal/dep/cso-data-portal"
+CSO_CONFIG_URL = f"{CSO_APP}/assets/config/appconfig.json"
+CSO_REFERER = f"{CSO_APP}/"
+
+# Waste Site Cleanup SPA (appconfig.json: API_ENDPOINT + FILESERVICEURL).
+WASTESITE_APP = "https://eeaonline.eea.state.ma.us/portal/dep/wastesite"
+WASTESITE_CONFIG_URL = f"{WASTESITE_APP}/assets/config/appconfig.json"
+WASTESITE_REFERER = f"{WASTESITE_APP}/"
+
+# EEA DataLake per-resource registry: resource -> (id_column, town_filter_param).
+# A wrong town key is silently ignored (returns the global total), so map exactly.
+DATALAKE_RESOURCES = {
+    "permit":        ("Id", "Town"),
+    "facility":      ("Id", "Town"),
+    "inspection":    ("Id", "Town"),
+    "enforcement":   ("Id", "Town"),
+    "asbestos":      ("Id", "TownName"),
+    "drinkingWater": ("Id", "Town"),
+    "leadandcopper": ("dwp_lab_data_id", "Town"),
+    "lsp":           ("LSPNumber", "TownName"),
+    "wire":          ("NOIId", "TownId"),          # numeric TownId (== MEPA TownId)
+    "welldrilling":  ("WellID", "TownName"),
+    "npdes":         ("lab_data_id", "citytown_of_sample"),
+    "searchablesite": ("RTN", "TownName"),  # Waste Site / Reportable Releases via DataLake
+}
 
 # SR-GHG filers spreadsheet
 SR_GHG_URL = "https://www.mass.gov/doc/sr-ghg-filers-list/download"
@@ -159,6 +194,9 @@ class MassEnvClient:
         self._mepa_cfg = None
         self._mepa_towns = None
         self._tooltips = None
+        self._datalake_base = None
+        self._cso_cfg = None
+        self._wastesite_cfg = None
 
     # ---- config discovery (re-scraped at runtime, never hard-coded) ----
 
@@ -384,6 +422,272 @@ class MassEnvClient:
                    if facility.upper() in str(r.get("Facility Name", "")).upper()]
         return out
 
+    # ============================ EEA DataLake ===============================
+    # One generic engine serves 11 Data Portal datasets (permit, facility,
+    # inspection, enforcement, asbestos, drinkingWater, leadandcopper, lsp,
+    # wire, welldrilling, npdes) — all {Items, TotalCount}, _start/_end paging.
+
+    def _fetch_head(self, url, max_bytes=524288):
+        """Fetch only the first max_bytes of a (possibly huge) HTML page as text.
+        The EEA Portal shell is ~5.8 MB; its config <meta> tags live in <head>."""
+        resp = self.http.request("GET", url, stream=True)
+        data = b""
+        for chunk in resp.iter_content(chunk_size=32768):
+            data += chunk
+            if len(data) >= max_bytes:
+                break
+        resp.close()
+        return data.decode("utf-8", "replace")
+
+    def datalake_base(self):
+        """Resolve the DataLake API base from the Portal shell's
+        <meta name="data-lake-api-url"> tag (re-scraped, never hard-coded)."""
+        if self._datalake_base is None:
+            html = self._fetch_head(DATALAKE_PORTAL + "/")
+            content = _meta_content(html, "data-lake-api-url")
+            if not content:
+                raise RuntimeError("data-lake-api-url meta not found on the EEA Portal page")
+            self._datalake_base = urljoin(DATALAKE_ORIGIN, content).rstrip("/")
+        return self._datalake_base
+
+    def _datalake_params(self, resource, town, filters):
+        """Build query params, mapping --town to the resource's town key
+        (Town / TownName / numeric TownId / citytown_of_sample)."""
+        if resource not in DATALAKE_RESOURCES:
+            raise ValueError(f"Unknown DataLake resource {resource!r}; "
+                             f"known: {sorted(DATALAKE_RESOURCES)}")
+        town_param = DATALAKE_RESOURCES[resource][1]
+        params = dict(filters or {})
+        if town not in (None, ""):
+            if town_param == "TownId":
+                # WIRE wants the numeric TownId; it equals the MEPA postal TownId.
+                params["TownId"] = town if str(town).isdigit() else self.mepa_town_id(town)
+            else:
+                params[town_param] = town if str(town).isdigit() else town.upper()
+        return params
+
+    def search_datalake(self, resource, *, town=None, filters=None, start=None,
+                        end=None, sort_col=None, sort_dir=None):
+        """Generic DataLake search -> {'Items': [...], 'TotalCount': N}. With no
+        _start/_end the server returns the first 100 rows (TotalCount is still the
+        full match count)."""
+        base = self.datalake_base()
+        params = self._datalake_params(resource, town, filters)
+        if start is not None:
+            params["_start"] = start
+        if end is not None:
+            params["_end"] = end
+        if sort_col:
+            params["ColumnName"] = sort_col
+            params["Direction"] = sort_dir or "asc"
+        return self.http.get_json(f"{base}/{resource}", params=params,
+                                  headers={"Referer": DATALAKE_REFERER})
+
+    def datalake_search_all(self, resource, *, town=None, filters=None,
+                            sort_col=None, sort_dir=None, page_size=1000, max_rows=None):
+        """Auto-paginate via _start/_end, deduping on the id column (handles
+        WIRE/Well-Drilling overlapping boundaries and LSP inclusive windows).
+        Returns (items, total_count)."""
+        id_col = DATALAKE_RESOURCES[resource][0]
+        items, seen, start, total = [], set(), 0, None
+        while True:
+            data = self.search_datalake(resource, town=town, filters=filters,
+                                        start=start, end=start + page_size,
+                                        sort_col=sort_col, sort_dir=sort_dir)
+            batch = data.get("Items") or []
+            if total is None:
+                total = data.get("TotalCount") or 0
+            new = 0
+            for r in batch:
+                k = r.get(id_col)
+                if k in seen:
+                    continue
+                seen.add(k)
+                items.append(r)
+                new += 1
+                if max_rows and len(items) >= max_rows:
+                    return items, total
+            if not batch or new == 0 or len(seen) >= (total or 0):
+                break
+            start += page_size
+        return items, total
+
+    def datalake_detail(self, resource, record_id, form_type=None):
+        """GET {base}/{resource}/{id} (+'/{form_type}' for asbestos)."""
+        if resource == "welldrilling":
+            raise ValueError("welldrilling has no JSON detail (500); use "
+                             "welldrilling-report <WellID> for the PDF instead")
+        base = self.datalake_base()
+        path = f"{resource}/{record_id}"
+        if resource == "asbestos":
+            if not form_type:
+                raise ValueError("asbestos detail requires --form-type (e.g. AQ-06 / ANF-001)")
+            path += f"/{form_type}"
+        return self.http.get_json(f"{base}/{path}", headers={"Referer": DATALAKE_REFERER})
+
+    def datalake_download_file(self, resource, file_id, dest):
+        """GET {base}/{resource}/downloadFile/{fileId} -> bytes. fileId = the last
+        path segment of a detail record's DocumentLinks[i].DocumentLinks URL."""
+        base = self.datalake_base()
+        resp = self.http.request("GET", f"{base}/{resource}/downloadFile/{file_id}",
+                                 headers={"Referer": DATALAKE_REFERER}, stream=True)
+        return _write_stream(resp, dest)
+
+    def datalake_export_excel(self, resource, *, town=None, filters=None, dest=None):
+        """GET {base}/{resource}/export-to/excel?{filters} -> .xlsx bytes."""
+        if resource == "inspection":
+            raise ValueError("inspection has no excel export; use search-portal ... --all")
+        base = self.datalake_base()
+        params = self._datalake_params(resource, town, filters)
+        resp = self.http.request("GET", f"{base}/{resource}/export-to/excel",
+                                 params=params, headers={"Referer": DATALAKE_REFERER},
+                                 stream=True)
+        return _write_stream(resp, dest)
+
+    def welldrilling_report(self, well_id, dest):
+        """GET {base}/WellDrilling/generatereport/{WellID} -> well-completion PDF."""
+        base = self.datalake_base()
+        resp = self.http.request("GET", f"{base}/WellDrilling/generatereport/{well_id}",
+                                 headers={"Referer": DATALAKE_REFERER}, stream=True)
+        return _write_stream(resp, dest)
+
+    # ===================== CSO / SSO Sewage Notification =====================
+
+    def cso_config(self):
+        if self._cso_cfg is None:
+            txt = self.http.request("GET", CSO_CONFIG_URL).content.decode("utf-8-sig")
+            self._cso_cfg = json.loads(txt)["AppConfig"]
+        return self._cso_cfg
+
+    def _cso_get(self, path, **kw):
+        """GET {API_ENDPOINT}/{path} with the REQUIRED Referer (HTTP 500 without it)."""
+        base = self.cso_config()["API_ENDPOINT"].rstrip("/") + "/"
+        headers = {"Referer": CSO_REFERER}
+        headers.update(kw.pop("headers", None) or {})
+        return self.http.get_json(base + path, headers=headers, **kw)
+
+    def search_cso(self, *, municipality=None, permitee=None, permitee_class=None,
+                   event_type=None, reporting_type=None, outfall=None, waterbody=None,
+                   from_date=None, to_date=None, order_by=None, page=1, page_size=25):
+        """GET Incident/GetIncidentsBySearchFields/ -> {results, rowCount, ...}.
+        municipality = town NAME (e.g. WORCESTER)."""
+        params = {"pageNumber": page, "pageSize": page_size}
+        if municipality:
+            params["Municipality"] = municipality.upper()
+        if permitee:
+            params["PermiteeName"] = permitee
+        if permitee_class:
+            params["PermiteeClass"] = permitee_class
+        if event_type:
+            params["EventType"] = event_type
+        if reporting_type:
+            params["ReportingType"] = reporting_type
+        if outfall:
+            params["OutfallId"] = outfall
+        if waterbody:
+            params["WaterBody"] = waterbody
+        if from_date:
+            params["IncidentFromDate"] = _usdate(from_date)
+        if to_date:
+            params["IncidentToDate"] = _usdate(to_date)
+        if order_by:
+            params["orderBy"] = order_by
+        return self._cso_get("Incident/GetIncidentsBySearchFields/", params=params)
+
+    def cso_detail(self, incident_id):
+        return self._cso_get("Incident/GetIncidentById", params={"id": incident_id})
+
+    def cso_attachments(self, incident_id, page=1, page_size=100):
+        return self._cso_get("Attachment/GetActiveAttachments",
+                             params={"id": incident_id, "pageNumber": page,
+                                     "pageSize": page_size})
+
+    def download_cso_attachment(self, incident_id, file_external_id, dest):
+        """GET Attachment/PortalDownload/{incidentId}/{fileExternalId} -> PDF.
+        file_external_id is the short token (NOT the attachmentId GUID)."""
+        base = self.cso_config()["API_ENDPOINT"].rstrip("/") + "/"
+        resp = self.http.request(
+            "GET", base + f"Attachment/PortalDownload/{incident_id}/{file_external_id}",
+            headers={"Referer": CSO_REFERER}, stream=True)
+        return _write_stream(resp, dest)
+
+    # ========================= Waste Site Cleanup ============================
+    # MassDEP Waste Site / Reportable Releases (21E / RTN) viewer.
+
+    def wastesite_config(self):
+        if self._wastesite_cfg is None:
+            txt = self.http.request("GET", WASTESITE_CONFIG_URL).content.decode("utf-8-sig")
+            cfg = json.loads(txt)["AppConfig"]
+            self._wastesite_cfg = {
+                "api": cfg["API_ENDPOINT"].rstrip("/"),
+                "fileservice": (cfg.get("FILESERVICEURL") or "").rstrip("/"),
+            }
+        return self._wastesite_cfg
+
+    def search_wastesite(self, *, town=None, address=None, rtn=None, site_name=None,
+                         lsp=None, chemical=None, zip_code=None, site_type=None,
+                         regulatory_status=None, order_by=None, page=1, page_size=25):
+        """GET viewer/GetViewerBySearchFields/ -> a raw row ARRAY; the total is
+        carried on every row as the string field 'totalCount'."""
+        base = self.wastesite_config()["api"]
+        params = {"pageNumber": page, "pageSize": page_size}
+        if town:
+            params["townName"] = town.upper()
+        if address:
+            params["address"] = address
+        if rtn:
+            params["rtn"] = rtn
+        if site_name:
+            params["siteName"] = site_name
+        if lsp:
+            params["lsp"] = lsp
+        if chemical:
+            params["chemical"] = chemical
+        if zip_code:
+            params["zipCode"] = zip_code
+        if site_type:
+            params["siteType"] = site_type
+        if regulatory_status:
+            params["regulatoryStatus"] = regulatory_status
+        if order_by:
+            params["orderBy"] = order_by
+        return self.http.get_json(f"{base}/viewer/GetViewerBySearchFields/",
+                                  params=params, headers={"Referer": WASTESITE_REFERER})
+
+    def wastesite_detail(self, rtn, reg_obj_id, secondary=False):
+        base = self.wastesite_config()["api"]
+        sec = "true" if secondary else "false"
+        return self.http.get_json(
+            f"{base}/viewer/GetDetailsByRTN/{rtn}/{reg_obj_id}/{sec}",
+            headers={"Referer": WASTESITE_REFERER})
+
+    def wastesite_files(self, rtn, electronic=False, sort_col="fileName",
+                        sort_dir="asc", page=1, page_size=25):
+        base = self.wastesite_config()["api"]
+        ep = "GetElectronicallyFiles" if electronic else "GetScannedFiles"
+        return self.http.get_json(
+            f"{base}/viewer/{ep}/{rtn}/{sort_col}/{sort_dir}/{page}/{page_size}",
+            headers={"Referer": WASTESITE_REFERER})
+
+    def download_wastesite_file(self, file_name_path, dest):
+        """GET {FILESERVICEURL}/{fileNamePath} -> bytes (path from a file-list row)."""
+        fs = self.wastesite_config()["fileservice"]
+        resp = self.http.request("GET", f"{fs}/{file_name_path.lstrip('/')}",
+                                 headers={"Referer": WASTESITE_REFERER}, stream=True)
+        return _write_stream(resp, dest)
+
+    def wastesite_export(self, filters, dest):
+        """GET viewer/ExportExcel/ -> {data: <base64 xlsx>}; decode -> dest."""
+        base = self.wastesite_config()["api"]
+        data = self.http.get_json(f"{base}/viewer/ExportExcel/", params=filters,
+                                  headers={"Referer": WASTESITE_REFERER})
+        return _b64_to_file(data.get("data") or "", dest)
+
+    def wastesite_meta(self):
+        base = self.wastesite_config()["api"]
+        return self.http.get_json(f"{base}/Metadata/GetMetadata",
+                                  headers={"Referer": WASTESITE_REFERER})
+
 
 # ─── helpers ──────────────────────────────────────────────────────────────────
 
@@ -483,6 +787,29 @@ def _addr(rec):
                                  a.get("ZipCode")] if p)
 
 
+def _meta_content(html, name):
+    """Extract a <meta name=... content=...> value (either attribute order)."""
+    m = re.search(r'<meta[^>]*\bname=["\']' + re.escape(name)
+                  + r'["\'][^>]*\bcontent=["\']([^"\']*)["\']', html, re.I)
+    if m:
+        return m.group(1)
+    m = re.search(r'<meta[^>]*\bcontent=["\']([^"\']*)["\'][^>]*\bname=["\']'
+                  + re.escape(name) + r'["\']', html, re.I)
+    return m.group(1) if m else None
+
+
+def _b64_to_file(b64, dest):
+    raw = base64.b64decode(b64)
+    with open(dest, "wb") as fh:
+        fh.write(raw)
+    return dest, len(raw)
+
+
+def _portal_columns(rows, limit=12):
+    """Default table columns = first row's keys (DataLake fields vary per resource)."""
+    return list(rows[0].keys())[:limit] if rows else []
+
+
 # ─── CLI ────────────────────────────────────────────────────────────────────────
 
 
@@ -575,12 +902,149 @@ def cmd_sr_ghg(c, args):
            "What to File", "File By", "Facility Type"], args.output)
 
 
+def _kv_filters(pairs):
+    out = {}
+    for kv in (pairs or []):
+        k, _, v = kv.partition("=")
+        out[k] = v
+    return out
+
+
+def cmd_search_portal(c, args):
+    filters = _kv_filters(args.filter)
+    if args.all:
+        items, total = c.datalake_search_all(
+            args.resource, town=args.town, filters=filters,
+            sort_col=args.sort, sort_dir=args.order)
+    else:
+        data = c.search_datalake(
+            args.resource, town=args.town, filters=filters,
+            start=args.start, end=args.end, sort_col=args.sort, sort_dir=args.order)
+        items = data.get("Items") or []
+        total = data.get("TotalCount")
+    print(f"{total} total; {len(items)} returned", file=sys.stderr)
+    _emit(items, args.format, _portal_columns(items), args.output)
+
+
+def cmd_portal_detail(c, args):
+    _dump(c.datalake_detail(args.resource, args.id, form_type=args.form_type),
+          args.output)
+
+
+def cmd_portal_download(c, args):
+    dest, n = c.datalake_download_file(args.resource, args.file_id,
+                                       args.output or f"{args.file_id}")
+    print(f"Downloaded {n} bytes -> {dest}")
+
+
+def cmd_portal_export(c, args):
+    dest, n = c.datalake_export_excel(
+        args.resource, town=args.town, filters=_kv_filters(args.filter),
+        dest=args.output or f"{args.resource}.xlsx")
+    print(f"Wrote {n} bytes -> {dest}")
+
+
+def cmd_welldrilling_report(c, args):
+    dest, n = c.welldrilling_report(args.well_id,
+                                    args.output or f"well_{args.well_id}.pdf")
+    print(f"Downloaded {n} bytes -> {dest}")
+
+
+def cmd_search_cso(c, args):
+    res = c.search_cso(
+        municipality=args.municipality, permitee=args.permitee,
+        permitee_class=args.permitee_class, event_type=args.event_type,
+        reporting_type=args.reporting_type, outfall=args.outfall,
+        waterbody=args.waterbody, from_date=getattr(args, "from"),
+        to_date=args.to, order_by=args.order_by, page=args.page,
+        page_size=args.page_size)
+    rows = res.get("results") or []
+    print(f"{res.get('rowCount')} total; {len(rows)} returned", file=sys.stderr)
+    _emit(rows, args.format,
+          ["incidentNumber", "incidentDate", "eventType", "permiteeName",
+           "outfallId", "municipality", "reportingType", "waterBody",
+           "volumnOfEvent", "incidentId"], args.output)
+
+
+def cmd_cso_detail(c, args):
+    _dump(c.cso_detail(args.incident_id), args.output)
+
+
+def cmd_cso_attachments(c, args):
+    res = c.cso_attachments(args.incident_id)
+    rows = res.get("results") or []
+    print(f"{len(rows)} attachment(s)", file=sys.stderr)
+    _emit(rows, args.format,
+          ["attachmentName", "fileExternalId", "attachmentSize", "attachmentId",
+           "incidentId"], args.output)
+
+
+def cmd_cso_download(c, args):
+    dest, n = c.download_cso_attachment(
+        args.incident_id, args.file_external_id,
+        args.output or f"{args.file_external_id}.pdf")
+    print(f"Downloaded {n} bytes -> {dest}")
+
+
+def cmd_search_wastesite(c, args):
+    rows = c.search_wastesite(
+        town=args.town, address=args.address, rtn=args.rtn, site_name=args.site_name,
+        lsp=args.lsp, chemical=args.chemical, zip_code=args.zip,
+        site_type=args.site_type, regulatory_status=args.regulatory_status,
+        order_by=args.order_by, page=args.page, page_size=args.page_size)
+    if not isinstance(rows, list):
+        rows = rows.get("results") or []
+    total = rows[0].get("totalCount") if rows else 0
+    print(f"{total} total; {len(rows)} returned", file=sys.stderr)
+    _emit(rows, args.format,
+          ["rtn", "siteName", "townName", "address", "siteType", "raoClass",
+           "complianceStatus", "chemicalType", "notificationDate", "lsp",
+           "regulateObjectId"], args.output)
+
+
+def cmd_wastesite_detail(c, args):
+    _dump(c.wastesite_detail(args.rtn, args.reg_obj_id, secondary=args.secondary),
+          args.output)
+
+
+def cmd_wastesite_files(c, args):
+    _dump(c.wastesite_files(args.rtn, electronic=args.electronic), args.output)
+
+
+def cmd_wastesite_download(c, args):
+    dest, n = c.download_wastesite_file(args.file_path,
+                                        args.output or "wastesite_file")
+    print(f"Downloaded {n} bytes -> {dest}")
+
+
+def cmd_wastesite_export(c, args):
+    filters = {}
+    if args.town:
+        filters["townName"] = args.town.upper()
+    if args.address:
+        filters["address"] = args.address
+    if args.rtn:
+        filters["rtn"] = args.rtn
+    dest, n = c.wastesite_export(filters, args.output or "wastesite.xlsx")
+    print(f"Wrote {n} bytes -> {dest}")
+
+
 def cmd_info(c, args):
+    def _safe(fn):
+        try:
+            return fn()
+        except Exception as e:  # noqa: BLE001 - info should never hard-fail
+            return f"<error: {e}>"
     info = {
-        "eplace_api": c.eplace_api(),
-        "mepa_api": c.mepa_config().get("API_ENDPOINT"),
-        "mepa_attachment_api": c.mepa_config().get("ATTACHMENT_API_ENDPOINT"),
-        "mepa_postal_api": c.mepa_config().get("POSTAL_API_ENDPOINT"),
+        "eplace_api": _safe(c.eplace_api),
+        "mepa_api": _safe(lambda: c.mepa_config().get("API_ENDPOINT")),
+        "mepa_attachment_api": _safe(lambda: c.mepa_config().get("ATTACHMENT_API_ENDPOINT")),
+        "mepa_postal_api": _safe(lambda: c.mepa_config().get("POSTAL_API_ENDPOINT")),
+        "datalake_api": _safe(c.datalake_base),
+        "datalake_resources": sorted(DATALAKE_RESOURCES),
+        "cso_api": _safe(lambda: c.cso_config().get("API_ENDPOINT")),
+        "wastesite_api": _safe(lambda: c.wastesite_config()["api"]),
+        "wastesite_fileservice": _safe(lambda: c.wastesite_config()["fileservice"]),
         "massdep_permit_groups": sorted(PERMIT_GROUPS),
         "massdep_statuses": MASSDEP_STATUSES,
         "sr_ghg_bundled": SR_GHG_BUNDLED,
@@ -661,6 +1125,128 @@ def build_parser():
     sp.add_argument("--refresh", action="store_true", help="re-download via wget first")
     add_fmt(sp)
     sp.set_defaults(func=cmd_sr_ghg)
+
+    # ---- EEA Data Portal "DataLake" (12 datasets, one generic engine) ----
+    portal_res = sorted(DATALAKE_RESOURCES)
+
+    sp = sub.add_parser("search-portal",
+                        help="Search an EEA Data Portal (DataLake) dataset")
+    sp.add_argument("resource", choices=portal_res,
+                    help="dataset: " + ", ".join(portal_res))
+    sp.add_argument("--town", help="town (mapped to the resource's town key)")
+    sp.add_argument("--filter", action="append", metavar="K=V",
+                    help="resource-specific filter, repeatable (e.g. --filter StreetName=WATER)")
+    sp.add_argument("--start", type=int, help="_start row offset")
+    sp.add_argument("--end", type=int, help="_end row offset (exclusive)")
+    sp.add_argument("--sort", help="sort column (ColumnName)")
+    sp.add_argument("--order", choices=["asc", "desc"], default="asc")
+    sp.add_argument("--all", action="store_true",
+                    help="auto-paginate + dedupe to fetch every matching row")
+    add_fmt(sp)
+    sp.set_defaults(func=cmd_search_portal)
+
+    sp = sub.add_parser("portal-detail", help="EEA DataLake record detail (JSON)")
+    sp.add_argument("resource", choices=portal_res)
+    sp.add_argument("id")
+    sp.add_argument("--form-type", help="required for asbestos (e.g. AQ-06 / ANF-001)")
+    sp.add_argument("-o", "--output")
+    sp.set_defaults(func=cmd_portal_detail)
+
+    sp = sub.add_parser("portal-download", help="Download a DataLake document by fileId")
+    sp.add_argument("resource", choices=portal_res)
+    sp.add_argument("file_id")
+    sp.add_argument("-o", "--output")
+    sp.set_defaults(func=cmd_portal_download)
+
+    sp = sub.add_parser("portal-export", help="Export a DataLake dataset to .xlsx")
+    sp.add_argument("resource", choices=portal_res)
+    sp.add_argument("--town")
+    sp.add_argument("--filter", action="append", metavar="K=V")
+    sp.add_argument("-o", "--output")
+    sp.set_defaults(func=cmd_portal_export)
+
+    sp = sub.add_parser("welldrilling-report",
+                        help="Download a well-completion report PDF by WellID")
+    sp.add_argument("well_id")
+    sp.add_argument("-o", "--output")
+    sp.set_defaults(func=cmd_welldrilling_report)
+
+    # ---- CSO / SSO Sewage Notification ----
+    sp = sub.add_parser("search-cso", help="Search CSO/SSO sewage discharge incidents")
+    sp.add_argument("--municipality", help="town name, e.g. WORCESTER")
+    sp.add_argument("--permitee")
+    sp.add_argument("--permitee-class", help="CSO | Non-CSO")
+    sp.add_argument("--event-type")
+    sp.add_argument("--reporting-type")
+    sp.add_argument("--outfall", help="outfall id, e.g. WOR001")
+    sp.add_argument("--waterbody")
+    sp.add_argument("--from", help="incident date from (YYYY-MM-DD)")
+    sp.add_argument("--to", help="incident date to (YYYY-MM-DD)")
+    sp.add_argument("--order-by", help="'field asc|desc'")
+    sp.add_argument("--page", type=int, default=1)
+    sp.add_argument("--page-size", type=int, default=25)
+    add_fmt(sp)
+    sp.set_defaults(func=cmd_search_cso)
+
+    sp = sub.add_parser("cso-detail", help="CSO incident detail by incidentId")
+    sp.add_argument("incident_id")
+    sp.add_argument("-o", "--output")
+    sp.set_defaults(func=cmd_cso_detail)
+
+    sp = sub.add_parser("cso-attachments", help="List a CSO incident's attachments")
+    sp.add_argument("incident_id")
+    add_fmt(sp)
+    sp.set_defaults(func=cmd_cso_attachments)
+
+    sp = sub.add_parser("cso-download", help="Download a CSO attachment (incidentId fileExternalId)")
+    sp.add_argument("incident_id")
+    sp.add_argument("file_external_id")
+    sp.add_argument("-o", "--output")
+    sp.set_defaults(func=cmd_cso_download)
+
+    # ---- Waste Site Cleanup (21E / RTN) ----
+    sp = sub.add_parser("search-wastesite",
+                        help="Search MassDEP Waste Site / Reportable Releases (21E/RTN)")
+    sp.add_argument("--town", help="town name, e.g. WORCESTER")
+    sp.add_argument("--address", help="street address, free text (cross-town)")
+    sp.add_argument("--rtn", help="Release Tracking Number")
+    sp.add_argument("--site-name")
+    sp.add_argument("--lsp")
+    sp.add_argument("--chemical")
+    sp.add_argument("--zip")
+    sp.add_argument("--site-type")
+    sp.add_argument("--regulatory-status")
+    sp.add_argument("--order-by", help="'col asc|desc'")
+    sp.add_argument("--page", type=int, default=1)
+    sp.add_argument("--page-size", type=int, default=25)
+    add_fmt(sp)
+    sp.set_defaults(func=cmd_search_wastesite)
+
+    sp = sub.add_parser("wastesite-detail", help="Waste site detail by RTN")
+    sp.add_argument("rtn")
+    sp.add_argument("--reg-obj-id", required=True, help="regulateObjectId from a search row")
+    sp.add_argument("--secondary", action="store_true")
+    sp.add_argument("-o", "--output")
+    sp.set_defaults(func=cmd_wastesite_detail)
+
+    sp = sub.add_parser("wastesite-files", help="List a waste site's scanned/e-filed docs")
+    sp.add_argument("rtn")
+    sp.add_argument("--electronic", action="store_true",
+                    help="electronically-submitted files (default: scanned)")
+    sp.add_argument("-o", "--output")
+    sp.set_defaults(func=cmd_wastesite_files)
+
+    sp = sub.add_parser("wastesite-download", help="Download a waste site file by path")
+    sp.add_argument("file_path", help="file path from a wastesite-files row")
+    sp.add_argument("-o", "--output")
+    sp.set_defaults(func=cmd_wastesite_download)
+
+    sp = sub.add_parser("wastesite-export", help="Export waste site search to .xlsx")
+    sp.add_argument("--town")
+    sp.add_argument("--address")
+    sp.add_argument("--rtn")
+    sp.add_argument("-o", "--output")
+    sp.set_defaults(func=cmd_wastesite_export)
 
     sp = sub.add_parser("info", help="Show discovered API bases + reference lists")
     sp.set_defaults(func=cmd_info)

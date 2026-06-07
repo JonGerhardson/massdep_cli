@@ -195,6 +195,117 @@ Use **`fileServiceId`** (a short token like `aegebahaj`) for download, *not* the
 
 ---
 
+# ADDENDUM (2026-06-06) — EEA Data Portal "DataLake", CSO, and WasteSite
+
+Three more no-login backends, all on `eeaonline.eea.state.ma.us`. NONE is ePlace
+(`eplace.eea.mass.gov/EEAPublicAppAPI`) and none is MEPA. Re-verified live 2026-06-06.
+
+> Seed-intel correction: the EEA Data Portal ("Search Data" menu — Permits, Facilities,
+> Inspections, Enforcements, Asbestos, Drinking Water, Lead & Copper, LSP, Wetland NOI,
+> Well Drilling, NPDES) is NOT an ePlace/Accela call — it's the EEA **DataLake** REST API.
+> Sewage Notification and Waste Site Cleanup are two further standalone SPAs/APIs.
+
+## 4. EEA Data Portal — DataLake API
+
+- Frontend SPA: `https://eeaonline.eea.state.ma.us/Portal/` (AngularJS ui-router;
+  logic in `…/Portal/dist/scripts/custom.js`).
+- **API base: `https://eeaonline.eea.state.ma.us/EEA/DataLake/V1.0/DataLakeAPI/`** — no
+  auth, no key, no cookie.
+- **Runtime config = an HTML `<meta>` tag, not a JSON file.** `GET /Portal/` → parse
+  `<meta name="data-lake-api-url" content="/EEA/DataLake/V1.0/DataLakeAPI/">` (root-relative;
+  resolve against the origin). The client streams only the first ~512 KB (the page is ~5.8 MB)
+  and regexes the meta. Also inlined: `file-viewer-url`, and a huge entity-encoded
+  `data-lake-lookup-tables` (dropdown values). Recommended header `Referer: …/Portal/`.
+
+### 4.1 Generic search — `GET {base}{resource}`
+One contract for all 12 resources → `{ "Items": [...], "TotalCount": N }`. Params: the
+resource-specific filters (table) + `_start` (0-based, inclusive) / `_end` (exclusive upper
+bound) offset window; `ColumnName` + `Direction` (`asc|desc`) sort. No `_start/_end` → first
+**100** rows but full `TotalCount`. A single large `_end` (≥ TotalCount) pulls everything.
+> **Paging quirks:** most resources treat `_end` as exclusive; **WIRE** & **Well Drilling**
+> share the boundary row between windows; **LSP** uses *inclusive* `_start/_end`. The client's
+> `datalake_search_all` dedupes on the id column to absorb all three.
+
+### 4.2 Per-resource registry (resource → id column / town-filter key)
+
+| resource | id column | town param | notable filters | detail | docs/export |
+|---|---|---|---|---|---|
+| `permit` | `Id` | `Town` | `StreetName`,`FacilityName`,`PermitNumber`,`Program`,`PermitType` | `permit/{Id}` | DocumentLinks (empty in current data); `export-to/excel` |
+| `facility` | `Id` | `Town` | `FacilityName`,`FacilityType`,`Active` | `facility/{Id}` | roster; excel |
+| `inspection` | `Id` | `Town` | `FacilityName`,`FacilityId`,`InspectionDate` | `inspection/{Id}` | **no export** — pull-all via big `_end` |
+| `enforcement` | `Id` | `Town` | `FacilityName`,`Address`,`EnforcementType`,`EnforcementDateFrom/To` | `enforcement/{Id}` | **DocumentLinks REAL** → §4.4; excel |
+| `asbestos` | `Id` | `TownName` | `FormType`(ANF-001/AQ-06),`FacilityName`,`FacilityAddress`,`StartDate/EndDate` | `asbestos/{Id}/{FormType}` (FormType req.) | excel |
+| `drinkingWater` | `Id` | `Town` | `PWSName`,`PWSId`,`Class`,`ChemicalName`,`CollectedDate` | `drinkingWater/{Id}` | excel |
+| `leadandcopper` | `dwp_lab_data_id` | `Town` | `FacilityType`(SCH/EECF/CCF),`SchoolName`,`AnalyteName`(LEAD/COPPER),`CollectionDate` | `leadandcopper/{id}` | excel |
+| `lsp` | `LSPNumber` | `TownName` | `LSPNumber`,`LicenseStatus`,`LastName` | `lsp/{LSPNumber}` | excel |
+| `wire` | `NOIId` | `TownId` (**numeric**) | `NOINum`,`FilingDate` | `wire/{NOIId}` | excel |
+| `welldrilling` | `WellID` | `TownName` | `DrillerRegistrationNumber`,`WellType`,`FromDateComplete/ToDateComplete` | **no JSON (500)** | **PDF: `WellDrilling/generatereport/{WellID}`**; excel |
+| `npdes` | `lab_data_id` | `citytown_of_sample` | `report_type`(`PFAS NPDES`/`PFAS Residuals`/`PFAS Groundwater Discharge`),`site_name`,`FromCollectionDate/ToCollectionDate` | `npdes/{lab_data_id}` | excel |
+| `searchablesite` | `RTN` | `TownName` | Waste Site / Reportable Releases via DataLake (fields: `RTN`,`SiteName`,`Address`,`ChemicalType`,`SiteType`,`RAOClass`,`ComplianceStatus`,`NotificationDate`,`Lat/Long`) | — (use WasteSiteAPI §6 for RTN detail) | excel |
+
+> **Resource set is closed (probed 2026-06-06).** The Portal `custom.js` `apiUrl` registry lists exactly
+> 13 segments; all return `{Items,TotalCount}` except `cso` (500 on the plain path — use the dedicated
+> CSOAPI §5). Brute-probing ~75 MassDEP program-area names (tier2, ust, septic, brownfields, chapter91,
+> wetlands, ghg, c21e, rtn, …) returned 404 for every one; no discovery/swagger/OData endpoint exists.
+> So the 12 usable DataLake resources above are the full set the API routes. (Caveat: an
+> unguessable-token resource used by some other EEA app can't be ruled out, but nothing surfaced.)
+
+> **Town-key landmine:** a wrong town key is *silently ignored* (returns the global total,
+> not an error/empty). The client hard-codes the registry mapping above; for `wire` the numeric
+> `TownId` is resolved via the MEPA postal lookup (DataLake TownId == MEPA TownId, e.g.
+> Worcester=450). Date params are `From<Col>`/`To<Col>` (server bumps `To` +1 day).
+> Validated Worcester counts: facility 1060, permit 1086, inspection 2017, enforcement 1188,
+> asbestos 22456, drinkingWater 7798, leadandcopper 19989, wire 1027, welldrilling 1191
+> (npdes is keyed on the sample's `citytown_of_sample` and is sparse — 0 for many towns).
+
+### 4.3 Detail / export / download
+- Detail: `GET {base}{resource}/{id}` (asbestos also `/{FormType}`; welldrilling → PDF, not JSON).
+- Export: `GET {base}{resource}/export-to/excel?{filters}` → `.xlsx` (GET only; not `inspection`).
+- Autocomplete: `GET {base}{resource}/autocomplete/{Column}?substring=`.
+- **4.4 Doc download:** `GET {base}{resource}/downloadFile/{fileId}` where `fileId` = last
+  path segment of a detail record's `DocumentLinks[i].DocumentLinks` URL. VALIDATED on
+  `enforcement` (5.8 MB PDF); only enforcement returns non-empty DocumentLinks in current data
+  (others unproven — see §gaps).
+
+## 5. CSO / SSO Sewage Notification (CSOAPI)
+- SPA `…/portal/dep/cso-data-portal/`; **API base `…/dep/CSOAPI/api/`** (no key).
+  Config (house way, BOM): `GET …/cso-data-portal/assets/config/appconfig.json` → `AppConfig.API_ENDPOINT`.
+- **REQUIRED header `Referer: …/portal/dep/cso-data-portal/`** — hard 500 without it.
+- Search: `GET Incident/GetIncidentsBySearchFields/?{params}&pageNumber=&pageSize=` →
+  `{results, rowCount, …}`. Params: `Municipality`(town NAME), `OutfallId`, `PermiteeName`,
+  `PermiteeClass`(CSO/Non-CSO), `EventType`, `ReportingType`, `WaterBody`, `IncidentFromDate/ToDate`,
+  `orderBy`. No street-address field. Validated Worcester=159 (e.g. outfall WOR001 → Mill Brook to Blackstone R.).
+- Detail `Incident/GetIncidentById?id=`; attachments `Attachment/GetActiveAttachments?id=…` →
+  `fileExternalId`; download `Attachment/PortalDownload/{incidentId}/{fileExternalId}` (token, NOT GUID).
+
+## 6. Waste Site Cleanup (WasteSiteAPI) — 21E / RTN
+- SPA `…/portal/dep/wastesite/`; **API base `…/dep/WasteSiteAPI/`** (no auth). Config:
+  `GET …/wastesite/assets/config/appconfig.json` → `AppConfig.API_ENDPOINT` + `FILESERVICEURL`.
+- Search: `GET viewer/GetViewerBySearchFields/?{params}&pageNumber=&pageSize=` → **a top-level
+  JSON ARRAY** (no wrapper); total is on every row as string `totalCount` (read `row[0].totalCount`).
+  Params: `townName`(UPPER), `address`(free text, cross-town), `rtn`, `siteName`, `lsp`, `chemical`,
+  `zipCode`, `siteType`, `regulatoryStatus`, `orderBy`. Fields: `rtn`, `regulateObjectId`, `townName`,
+  `address`, `siteName`, `siteType`, `category`, `chemicalType`, `releaseType`, `notificationDate`,
+  `complianceStatus`, `raoClass`, `lsp`, `latitude/longitude`, `aulInfo`. Validated Worcester=1782;
+  `address=` is free-text and matches across towns (e.g. `address="SOUTHWEST CUTOFF"` → 75 rows,
+  including RTN `2-0053500`/regObjId 674115 — DIESEL DIRECT, OPEN).
+- Detail: `GET viewer/GetDetailsByRTN/{rtn}/{regulateObjectId}/{false}` (8 result sections).
+- Files: `GET viewer/Get{Scanned|Electronically}Files/{rtn}/{sortCol}/{sortDir}/{page}/{size}`.
+  Download: `GET {FILESERVICEURL}{fileName-path}` (INFERRED — no sampled RTN had files).
+- Bulk: `GET viewer/ExportExcel/?{params}` → `{data: <base64 xlsx>}` (decode before writing).
+
+> NOTE — two distinct "Waste Site" things: the in-Portal **DataLake `searchablesite`** resource
+> (`?TownName=WORCESTER`→1775) and this standalone **WasteSiteAPI** viewer (Worcester=1782). The client
+> uses the WasteSiteAPI viewer (richer: RTN detail, file lists, RAO/tier sections).
+
+### Gaps / cautions
+- DataLake doc download proven only for `enforcement`; other resources' `downloadFile`/permit
+  direct-link variant are inferred from JS.
+- WasteSite file download is fully inferred (no sampled RTN had populated file lists).
+- WIRE/WellDrilling overlap the page boundary; LSP uses inclusive ends → always dedupe on the id col.
+
+---
+
 ## Field cross-reference
 
 | Concept | MassDEP ePlace | MEPA eMonitor | SR-GHG |
