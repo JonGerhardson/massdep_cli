@@ -150,7 +150,12 @@ returns `totalRecords 0`. Cross-link the sources via `eeaNo` (MEPA) ↔ `MepaPro
   row as string `totalCount`. **CSO** (`…/dep/CSOAPI/api/`): a `Referer` header is a hard server gate
   (HTTP 500 without it). Both discover their base from `appconfig.json` like MEPA.
 - Full endpoint/field documentation incl. the per-resource registry: **`references/API_NOTES.md`**
-  (see the 2026-06-06 ADDENDUM).
+  (see the 2026-06-06 ADDENDUM). These field lists are **reverse-engineered** — no API ships a schema.
+- For the **officially published** MA-state field/code definitions backing each endpoint (what the
+  permit codes / compliance statuses / RAO & Tier classes / PFAS fields mean, and the regulation that
+  defines them), see **`references/DATA_DICTIONARIES.md`**, with offline copies of the source PDFs /
+  xlsx / FGDC metadata in **`data/dictionaries/`**. `data.mass.gov` (Massachusetts Data Hub) and
+  `gis.data.mass.gov` (MassGIS) are the catalog/GIS discovery layers, not data stores themselves.
 
 ## Dependencies
 
@@ -165,5 +170,6 @@ the vendor; for documents not online, file a request via govqa.
 
 ## Source
 
-Client + CLI: `mass_env.py` (in this skill dir). Endpoint reference: `references/API_NOTES.md`.
+Client + CLI: `mass_env.py` (in this skill dir). Endpoint reference: `references/API_NOTES.md`;
+official data dictionaries: `references/DATA_DICTIONARIES.md` + `data/dictionaries/`.
 Bundled data: `data/sr-ghg-filers-list.xlsx`.
